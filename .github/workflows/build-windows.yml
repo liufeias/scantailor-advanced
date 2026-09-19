@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: write         
 
 jobs:
   build-windows:
@@ -34,57 +35,46 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '319504a5326aa870edde46438c5455fa76305a56'
 
+      # ---------- 用 NuGet 缓存代替已废弃的 x-gha ----------
+      - name: Configure vcpkg binary cache
+        shell: pwsh
+        run: |
+          # 用 GitHub Packages 作为 NuGet 二进制缓存源
+          $env:VCPKG_BINARY_SOURCES = "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite"
+          echo "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES" >> $env:GITHUB_ENV
+          echo "VCPKG_FEATURE_FLAGS=manifests,binarycaching" >> $env:GITHUB_ENV
+
+      - name: Authenticate NuGet for vcpkg cache
+        shell: pwsh
+        run: |
+          # 配置 NuGet 认证，让 vcpkg 能读写 GitHub Packages
+          & "$env:VCPKG_ROOT/vcpkg" fetch nuget `
+            --nuget-source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" `
+            --nuget-token "${{ secrets.GITHUB_TOKEN }}" 2>&1 | Out-Null
+          # 也写一份到 NuGet 全局配置，确保 vcpkg 调用 nuget.exe 时能认证
+          $nugetConfig = "$env:APPDATA/NuGet/NuGet.Config"
+          if (-not (Test-Path (Split-Path $nugetConfig))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $nugetConfig) | Out-Null
+          }
+          @"
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="github" value="https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <github>
+      <add key="Username" value="${{ github.actor }}" />
+      <add key="ClearTextPassword" value="${{ secrets.GITHUB_TOKEN }}" />
+    </github>
+  </packageSourceCredentials>
+</configuration>
+"@ | Out-File -Encoding utf8 $nugetConfig
+
       - name: Install dependencies with vcpkg
         shell: pwsh
         run: |
           vcpkg install libjpeg-turbo:x64-windows zlib:x64-windows libpng:x64-windows tiff:x64-windows boost:x64-windows
-
-      # ---------- 把 vcpkg 的库摆成 CMakeLists 期望的 ../libs 结构 ----------
-      - name: Map vcpkg libs to ../libs layout
-        shell: pwsh
-        run: |
-          $vcpkgRoot = "${{ github.workspace }}/vcpkg/installed/x64-windows"
-          $libsRoot  = "${{ github.workspace }}/libs"
-          New-Item -ItemType Directory -Force -Path $libsRoot | Out-Null
-
-          # 每个库在 CMakeLists 里期望的目录名
-          $libMap = @{
-            "jpeg-62"   = "jpeg"
-            "zlib"      = "zlib"
-            "libpng16"  = "libpng-1.6.40"
-            "tiff-4.6"  = "tiff-4.6.0"
-          }
-
-          foreach ($dst in $libMap.Keys) {
-            $name = $libMap[$dst]
-            $target = Join-Path $libsRoot $dst
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-            # include
-            if (Test-Path "$vcpkgRoot/include") {
-              Copy-Item -Recurse -Force "$vcpkgRoot/include" "$target/include"
-            }
-            # lib
-            New-Item -ItemType Directory -Force -Path "$target/lib" | Out-Null
-            Get-ChildItem "$vcpkgRoot/lib" -Filter "*$name*" -ErrorAction SilentlyContinue |
-              Copy-Item -Force -Destination "$target/lib"
-          }
-
-          # 兜底：把 vcpkg 的 include / lib / bin 整体也放一份到 libs 根，方便 find_package 命中
-          Copy-Item -Recurse -Force "$vcpkgRoot/include" "$libsRoot/include" -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "$libsRoot/lib" | Out-Null
-          Copy-Item -Force "$vcpkgRoot/lib/*.lib" "$libsRoot/lib" -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "$libsRoot/bin" | Out-Null
-          Copy-Item -Force "$vcpkgRoot/bin/*.dll" "$libsRoot/bin" -ErrorAction SilentlyContinue
-
-          # Qt 和 Boost 目录（CMakeLists 里找的是 libs/Qt 和 libs/Boost）
-          $qtDir = "$env:Qt5_DIR/.."
-          if (Test-Path $qtDir) {
-            Copy-Item -Recurse -Force $qtDir "$libsRoot/Qt"
-          }
-          # Boost 只需要头文件和 lib，vcpkg 已经装好
-          New-Item -ItemType Directory -Force -Path "$libsRoot/Boost" | Out-Null
-          Copy-Item -Recurse -Force "$vcpkgRoot/include/boost" "$libsRoot/Boost/boost" -ErrorAction SilentlyContinue
-          Copy-Item -Recurse -Force "$vcpkgRoot/include/boost-*" "$libsRoot/Boost/" -ErrorAction SilentlyContinue
 
       # ---------- 配置 & 构建 ----------
       - name: Configure CMake
@@ -101,12 +91,41 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --parallel
 
-      # ---------- CPack 打 ZIP ----------
-      - name: Package with CPack (ZIP)
+      # ---------- 手动打包：exe + 所有 DLL + 插件 ----------
+      - name: Package (exe + all DLLs)
         shell: pwsh
-        working-directory: build
         run: |
-          cpack -G ZIP -C Release
+          $stage = "package-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # exe 和依赖 DLL（build/Release 下已经由 CMake 复制好）
+          Copy-Item build/Release/*.exe $stage -Force
+          Copy-Item build/Release/*.dll $stage -Force
+
+          # Qt 插件（platforms/qwindows.dll 等）
+          if (Test-Path "build/Release/platforms") {
+            Copy-Item -Recurse build/Release/platforms $stage
+          }
+          # Qt 翻译
+          if (Test-Path "build/Release/translations") {
+            Copy-Item -Recurse build/Release/translations $stage
+          }
+          # Qt 图像格式插件
+          if (Test-Path "build/Release/imageformats") {
+            Copy-Item -Recurse build/Release/imageformats $stage
+          }
+          if (Test-Path "build/Release/iconengines") {
+            Copy-Item -Recurse build/Release/iconengines $stage
+          }
+          if (Test-Path "build/Release/styles") {
+            Copy-Item -Recurse build/Release/styles $stage
+          }
+
+          # 列出打包内容，方便排查
+          Write-Host "=== Package contents ==="
+          Get-ChildItem -Recurse $stage | Select-Object FullName
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "scantailor-advanced-win64.zip" -Force
           Get-ChildItem *.zip
 
       # ---------- 上传 artifact ----------
@@ -114,14 +133,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scantailor-windows-zip
-          path: build/*.zip
+          path: scantailor-advanced-win64.zip
 
       # ---------- 发布到 GitHub Release ----------
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/*.zip
+          files: scantailor-advanced-win64.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
