@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies with vcpkg
         shell: pwsh
         run: |
-          vcpkg install jpeg:x64-windows zlib:x64-windows libpng:x64-windows tiff:x64-windows boost-test:x64-windows
+          vcpkg install libjpeg-turbo:x64-windows zlib:x64-windows libpng:x64-windows tiff:x64-windows boost-test:x64-windows
 
       # ---------- 把 vcpkg 的库摆成 CMakeLists 期望的 ../libs 结构 ----------
       - name: Map vcpkg libs to ../libs layout
