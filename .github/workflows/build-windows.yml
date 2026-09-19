@@ -1,9 +1,12 @@
 name: Build Windows (MSVC + Qt5 + vcpkg)
 
 on:
-  # push:
-  #   tags:
-  #     - 'v*'
+  push:
+    branches: [ master, main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ master, main ]
   workflow_dispatch:
 
 jobs:
@@ -22,15 +25,7 @@ jobs:
           arch: 'win64_msvc2019_64'
           cache: true
 
-      # 2. 准备 vcpkg 缓存（大幅降低重构时间）
-      - name: Setup vcpkg GitHub Actions Cache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      # 3. 安装依赖（关键修改：绝不安装完整的 boost，仅安装所需组件）
+      # 2. 安装必要依赖（只需 boost-test 和 boost-headers，约 2-3 分钟搞定）
       - name: Install dependencies via vcpkg
         run: |
           vcpkg install --triplet x64-windows `
@@ -39,11 +34,9 @@ jobs:
             libpng `
             tiff `
             boost-headers `
-            boost-unit-test-framework
-        env:
-          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+            boost-test
 
-      # 4. 配置 CMake
+      # 3. 配置 CMake
       - name: Configure CMake
         run: |
           cmake -B build -S . `
@@ -53,40 +46,33 @@ jobs:
             -DBUILD_TESTS=OFF `
             -DCMAKE_PREFIX_PATH="$env:Qt5_DIR"
 
-      # 5. 编译项目
+      # 4. 编译项目
       - name: Build Project
         run: |
           cmake --build build --config Release --parallel
 
-      # 6. 收集并补齐所有 DLL（双保险，防止任何隐式 DLL 丢失）
+      # 5. 补齐所有 DLL（防止任何漏网的 dll）
       - name: Stage Dependencies and DLLs
         shell: pwsh
         run: |
           $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin"
           $releaseDir = "build/Release"
           
-          # 把 vcpkg bin 下面的所有 dll（包括 jpeg62.dll, liblzma.dll 等）复制到 Release 目录
-          Write-Host "Copying all vcpkg runtime DLLs..."
+          # 拷贝 vcpkg 下所有 dll (jpeg62.dll, liblzma.dll, tiff.dll, zlib.dll 等)
+          Write-Host "Copying vcpkg DLLs..."
           Copy-Item -Force "$vcpkgBin/*.dll" $releaseDir
           
-          # 拷贝 Qt 依赖库
-          windeployqt --release --no-translations --compiler-runtime "$releaseDir/scantailor.exe"
+          # 拷贝 Qt 运行时及插件
+          Write-Host "Running windeployqt..."
+          & "$env:QT_ROOT_DIR/bin/windeployqt.exe" --release --no-translations --compiler-runtime "$releaseDir/scantailor.exe"
 
-      # 7. 打包成 ZIP
+      # 6. 打包成 ZIP
       - name: Package with CPack
         run: |
           cd build
           cpack -G ZIP -C Release
 
-      # 8. 收集安装包（若 CPack 漏网，此步骤确保 ZIP 内包含所有 DLL）
-      - name: Ensure ZIP integrity
-        shell: pwsh
-        run: |
-          # 也可以直接将打包好的 Release 目录打成便携版 zip 作为备用产物
-          $zipName = Get-ChildItem -Path "build/*.zip" | Select-Object -First 1
-          Write-Host "Generated package: $($zipName.FullName)"
-
-      # 9. 上传 Artifact (每次 push 均可下载)
+      # 7. 上传构建产物 (在 GitHub Actions 页面随时可下载)
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -94,7 +80,7 @@ jobs:
           path: build/*.zip
           if-no-files-found: error
 
-      # 10. 发布 Release (仅在打 tag 时触发，例如 git push origin v1.1.1)
+      # 8. 发布 Release (仅在打 tag 时触发，例如 git tag v1.1.1 && git push origin v1.1.1)
       - name: Release to GitHub Releases
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
