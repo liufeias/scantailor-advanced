@@ -132,7 +132,11 @@ endif()
 find_package(JPEG REQUIRED)
 
 if (WIN32)
-  add_dynamic_library_locations(JPEG::JPEG "libjpeg-62.dll")
+  if (MSVC)
+    add_dynamic_library_locations(JPEG::JPEG "jpeg62.dll")
+  else()
+    add_dynamic_library_locations(JPEG::JPEG "libjpeg-62.dll")
+  endif()
 endif()
 
 #=================================== ZLIB ===================================#
