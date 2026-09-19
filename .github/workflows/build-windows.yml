@@ -1,0 +1,127 @@
+name: Build Windows
+
+on:
+  # push:
+  #   tags:
+  #     - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (MSVC + Qt5 + vcpkg)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ---------- Qt5 ----------
+      - name: Install Qt5
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          arch: 'win64_msvc2019_64'
+          cache: true
+          modules: 'qtnetworkauth'
+
+      # ---------- vcpkg ----------
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '319504a5326aa870edde46438c5455fa76305a56'
+
+      - name: Install dependencies with vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install jpeg:x64-windows zlib:x64-windows libpng:x64-windows tiff:x64-windows boost-test:x64-windows
+
+      # ---------- 把 vcpkg 的库摆成 CMakeLists 期望的 ../libs 结构 ----------
+      - name: Map vcpkg libs to ../libs layout
+        shell: pwsh
+        run: |
+          $vcpkgRoot = "${{ github.workspace }}/vcpkg/installed/x64-windows"
+          $libsRoot  = "${{ github.workspace }}/libs"
+          New-Item -ItemType Directory -Force -Path $libsRoot | Out-Null
+
+          # 每个库在 CMakeLists 里期望的目录名
+          $libMap = @{
+            "jpeg-62"   = "jpeg"
+            "zlib"      = "zlib"
+            "libpng16"  = "libpng-1.6.40"
+            "tiff-4.6"  = "tiff-4.6.0"
+          }
+
+          foreach ($dst in $libMap.Keys) {
+            $name = $libMap[$dst]
+            $target = Join-Path $libsRoot $dst
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            # include
+            if (Test-Path "$vcpkgRoot/include") {
+              Copy-Item -Recurse -Force "$vcpkgRoot/include" "$target/include"
+            }
+            # lib
+            New-Item -ItemType Directory -Force -Path "$target/lib" | Out-Null
+            Get-ChildItem "$vcpkgRoot/lib" -Filter "*$name*" -ErrorAction SilentlyContinue |
+              Copy-Item -Force -Destination "$target/lib"
+          }
+
+          # 兜底：把 vcpkg 的 include / lib / bin 整体也放一份到 libs 根，方便 find_package 命中
+          Copy-Item -Recurse -Force "$vcpkgRoot/include" "$libsRoot/include" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$libsRoot/lib" | Out-Null
+          Copy-Item -Force "$vcpkgRoot/lib/*.lib" "$libsRoot/lib" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$libsRoot/bin" | Out-Null
+          Copy-Item -Force "$vcpkgRoot/bin/*.dll" "$libsRoot/bin" -ErrorAction SilentlyContinue
+
+          # Qt 和 Boost 目录（CMakeLists 里找的是 libs/Qt 和 libs/Boost）
+          $qtDir = "$env:Qt5_DIR/.."
+          if (Test-Path $qtDir) {
+            Copy-Item -Recurse -Force $qtDir "$libsRoot/Qt"
+          }
+          # Boost 只需要头文件和 lib，vcpkg 已经装好
+          New-Item -ItemType Directory -Force -Path "$libsRoot/Boost" | Out-Null
+          Copy-Item -Recurse -Force "$vcpkgRoot/include/boost" "$libsRoot/Boost/boost" -ErrorAction SilentlyContinue
+          Copy-Item -Recurse -Force "$vcpkgRoot/include/boost-*" "$libsRoot/Boost/" -ErrorAction SilentlyContinue
+
+      # ---------- 配置 & 构建 ----------
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DBUILD_TESTS=OFF `
+            -DCMAKE_PREFIX_PATH="${{ env.Qt5_DIR }};${{ github.workspace }}/vcpkg/installed/x64-windows"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      # ---------- CPack 打 ZIP ----------
+      - name: Package with CPack (ZIP)
+        shell: pwsh
+        working-directory: build
+        run: |
+          cpack -G ZIP -C Release
+          Get-ChildItem *.zip
+
+      # ---------- 上传 artifact ----------
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scantailor-windows-zip
+          path: build/*.zip
+
+      # ---------- 发布到 GitHub Release ----------
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
